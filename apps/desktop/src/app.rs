@@ -6,6 +6,7 @@
 //! work.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use clumsiesd::{DaemonDraftOperationResponse, DaemonDraftSummary};
 use gpui_kit::base::Disableable;
@@ -20,6 +21,7 @@ use crate::components::modal;
 use crate::engine::{
     self, Checkout, DocumentEdit, EngineStatus, Period, Project, Review, ReviewStatus,
 };
+use crate::project_refresh::{ProjectRefresh, retained_selection};
 use crate::screens::dashboard::{AboutDialog, DashboardScreen, Metric};
 use crate::screens::dialogs::{ConfirmDialog, DialogAction, RenameDialog, RenameFolderDialog};
 use crate::screens::document::{self, Mode, Notice, SAVE_DELAY, SaveState};
@@ -51,6 +53,10 @@ pub struct DesktopApp {
     projects: Vec<Project>,
     /// Why the Project list could not be read, when it could not be.
     projects_error: Option<String>,
+    project_refresh: ProjectRefresh,
+    window_active: bool,
+    _project_poll: Task<()>,
+    _project_activation: Subscription,
     /// Whose session the daemon holds, when it holds one. The rail's foot and
     /// the Settings screen both name it.
     account: Option<engine::Account>,
@@ -123,11 +129,36 @@ impl DesktopApp {
             // that changes appearance takes the accent with it.
             ui::apply_brand(cx);
         });
+        let project_activation = cx.observe_window_activation(window, |app, window, cx| {
+            app.window_active = window.is_window_active();
+            if app.window_active {
+                app.refresh_projects(cx);
+            }
+        });
+        let project_poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                if this
+                    .update(cx, |app, cx| {
+                        if app.window_active {
+                            app.refresh_projects(cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut app = Self {
             engine,
-            selected_project: signed_in.then_some(0),
+            selected_project: (signed_in && !projects.is_empty()).then_some(0),
             projects,
             projects_error,
+            project_refresh: ProjectRefresh::default(),
+            window_active: window.is_window_active(),
+            _project_poll: project_poll,
+            _project_activation: project_activation,
             account: account.ok(),
             memory,
             reviews,
@@ -282,6 +313,7 @@ impl DesktopApp {
                 return;
             }
         }
+        self.project_refresh.invalidate();
         self.account = None;
         self.projects.clear();
         self.projects_error = None;
@@ -1747,8 +1779,74 @@ impl DesktopApp {
         }
     }
 
+    /// Membership can change while this window stays open. Read only the list
+    /// in the background: reloading the workspace would replace open editors.
+    fn refresh_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(generation) = self.project_refresh.begin(self.signed_in) else {
+            return;
+        };
+        let work = cx.background_executor().spawn(async { engine::projects() });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |app, cx| {
+                if app.project_refresh.complete(generation) && app.signed_in {
+                    app.projects_refreshed(result, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn projects_refreshed(&mut self, result: Result<Vec<Project>, String>, cx: &mut Context<Self>) {
+        let projects = match result {
+            Ok(projects) => projects,
+            Err(error) => {
+                // A failed read must not erase the last usable list or editor.
+                if self.projects_error.as_ref() != Some(&error) {
+                    crate::logging::error(&format!("could not refresh the projects: {error}"));
+                }
+                self.projects_error = Some(error);
+                return;
+            }
+        };
+        let had_error = self.projects_error.take().is_some();
+        if projects == self.projects {
+            if had_error {
+                cx.notify();
+            }
+            return;
+        }
+        let selected_id = self
+            .selected_project
+            .and_then(|index| self.projects.get(index))
+            .map(|project| project.project_id.as_str());
+        let selected = retained_selection(
+            selected_id,
+            projects.iter().map(|project| project.project_id.as_str()),
+        );
+        if selected_id.is_some() && selected.is_none() {
+            // Retain unsaved work until it can be stored locally. A later poll
+            // retries the membership update after pending operations finish.
+            if self.memory_busy || !self.flush_pending_saves(cx) {
+                return;
+            }
+            self.memory.set_checkout(
+                None,
+                Some("This project is no longer available to your account.".into()),
+                cx,
+            );
+            self.reviews.set_project(None, cx);
+            self.dashboard.set_project(None, cx);
+        }
+        self.selected_project = selected;
+        self.projects = projects;
+        cx.notify();
+    }
+
     /// Re-reads everything a session unlocks.
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.project_refresh.invalidate();
         self.engine = engine::engine_status();
         let (projects, projects_error) = read_projects();
         let account = read_account();
@@ -1884,6 +1982,7 @@ impl DesktopApp {
     /// A memory space the Server has just created: the list is re-read, and the
     /// window works in the space the reader made rather than the one it was in.
     pub fn memory_space_created(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        self.project_refresh.invalidate();
         let (projects, projects_error) = read_projects();
         self.projects = projects;
         self.projects_error = projects_error;
@@ -1900,10 +1999,8 @@ impl DesktopApp {
     /// A memory space was renamed or described again: the Project list, which
     /// every header draws the name from, is re-read.
     pub fn memory_space_changed(&mut self, cx: &mut Context<Self>) {
-        let (projects, projects_error) = read_projects();
-        self.projects = projects;
-        self.projects_error = projects_error;
-        cx.notify();
+        self.project_refresh.invalidate();
+        self.projects_refreshed(engine::projects(), cx);
     }
 
     /// Re-reads whose session the daemon holds, which is what the Account pane
@@ -2261,6 +2358,7 @@ impl DesktopApp {
     /// client is not talking to anything.
     pub fn recheck_engine(&mut self, cx: &mut Context<Self>) {
         self.engine = engine::engine_status();
+        self.refresh_projects(cx);
         match &self.engine {
             EngineStatus::Connected(health) => crate::logging::info(&format!(
                 "engine connected: daemon {} at {}",
@@ -2279,11 +2377,25 @@ impl DesktopApp {
         crate::components::project_filter::project_filter(
             self.projects
                 .iter()
-                .map(|project| project.name.clone())
+                .map(|project| (project.project_id.clone(), project.name.clone()))
                 .collect(),
-            self.selected_project,
-            move |index, _, cx| {
-                selecting.update(cx, |app, cx| app.choose_project(index, cx));
+            self.selected_project
+                .and_then(|index| self.projects.get(index))
+                .map(|project| project.project_id.clone()),
+            move |project_id, _, cx| {
+                selecting.update(cx, |app, cx| {
+                    if let Some(project_id) = project_id {
+                        if let Some(index) = app
+                            .projects
+                            .iter()
+                            .position(|project| project.project_id == project_id)
+                        {
+                            app.choose_project(Some(index), cx);
+                        }
+                    } else {
+                        app.choose_project(None, cx);
+                    }
+                });
             },
             move |window, cx| {
                 creating.update(cx, |app, cx| app.open_new_memory_space(window, cx));
