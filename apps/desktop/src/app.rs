@@ -5,7 +5,7 @@
 //! WorkspaceView composes the shell, and the models behind each section hold the
 //! work.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use clumsiesd::{DaemonDraftOperationResponse, DaemonDraftSummary};
@@ -79,6 +79,8 @@ pub struct DesktopApp {
     /// has superseded must not report its result as the editor's state.
     save_generation: u64,
     saves_in_flight: BTreeSet<u64>,
+    /// Successful flushes outlive their panes and cancel older delayed stores.
+    flushed_saves: BTreeMap<String, u64>,
     memory_busy: bool,
     /// Dropping it stops watching the system's light or dark preference.
     _appearance: Subscription,
@@ -170,6 +172,7 @@ impl DesktopApp {
             signed_in,
             save_generation: 0,
             saves_in_flight: BTreeSet::new(),
+            flushed_saves: BTreeMap::new(),
             memory_busy: false,
             _appearance: appearance,
         };
@@ -837,6 +840,10 @@ impl DesktopApp {
                 pane.set_save_state(SaveState::Saving);
             }
             let result = engine::store_document(&edit);
+            if result.is_ok() {
+                self.flushed_saves
+                    .insert(resource_id.clone(), self.save_generation);
+            }
             match &result {
                 Ok(_) => {
                     crate::logging::info(&format!("stored {} as the window closed", edit.path))
@@ -1564,10 +1571,15 @@ impl DesktopApp {
     /// operation and uploads it, so this returns before the Server has it; the
     /// Review request is what waits for the upload.
     fn save_document(&mut self, generation: u64, edit: DocumentEdit, cx: &mut Context<Self>) {
-        // A later keystroke in the same document has already asked for a newer
-        // store, and that one carries the newer text. A document whose tab has
-        // closed has no pane to ask, and its last edit still belongs to the
-        // engine, so it goes.
+        // A successful flush supersedes delayed stores even after its pane is
+        // gone. Other closed panes may still have text the engine has not seen.
+        if self
+            .flushed_saves
+            .get(&edit.resource_id)
+            .is_some_and(|flushed| generation <= *flushed)
+        {
+            return;
+        }
         if let Some(pane) = self.memory.pane_for_resource(&edit.resource_id)
             && pane.generation() != generation
         {
@@ -1892,13 +1904,18 @@ impl DesktopApp {
         };
         self.reviews.begin_list_read();
         cx.notify();
+        let scope = project_id.clone();
         let work = cx
             .background_executor()
             .spawn(async move { engine::reviews(&project_id) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            this.update(cx, |app, cx| app.reviews_loaded(result, cx))
-                .ok();
+            this.update(cx, |app, cx| {
+                if app.reviews.project_id() == Some(scope.as_str()) {
+                    app.reviews_loaded(result, cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -2069,13 +2086,18 @@ impl DesktopApp {
         let Some(review_id) = self.reviews.open_id().map(str::to_owned) else {
             return;
         };
+        let open = review_id.clone();
         let work = cx
             .background_executor()
             .spawn(async move { engine::review(&review_id) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            this.update(cx, |app, cx| app.review_loaded(result, cx))
-                .ok();
+            this.update(cx, |app, cx| {
+                if app.reviews.open_id() == Some(open.as_str()) {
+                    app.review_loaded(result, cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -2135,11 +2157,16 @@ impl DesktopApp {
         action: impl FnOnce() -> Result<(), String> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        let scope = self.reviews.project_id().map(str::to_owned);
         let work = cx.background_executor().spawn(async move { action() });
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            this.update(cx, |app, cx| app.review_action_finished(what, result, cx))
-                .ok();
+            this.update(cx, |app, cx| {
+                if app.reviews.project_id() == scope.as_deref() {
+                    app.review_action_finished(what, result, cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
