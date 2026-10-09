@@ -109,10 +109,11 @@ install the fresh session in the daemon before reporting success.
 Agents are machine-wide integrations, separate from project work folders.
 Codex status reflects plugin inspection, including a missing host or a plugin
 needing repair. On Windows, installation copies the bundled MCP executable and
-its adjacent DLLs to `%USERPROFILE%\.clumsies\agent-runtimes\codex\<runtime-hash>`.
+its adjacent DLLs to `%USERPROFILE%\.clumsies\agent-runtimes\codex\<bundle-hash>`.
 The plugin uses that absolute path because Store-installed hosts can redirect
-AppData, including an installation on another drive. Copies are versioned and
-unchanged files are reused so existing Codex sessions can keep their runtime.
+AppData, including an installation on another drive. The version includes the
+executable and DLL contents; unchanged files are reused so existing Codex
+sessions can keep their runtime, including during installer-only CRT updates.
 Opening Settings upgrades an enabled integration to the new path; project
 bindings and account data are unchanged. Plugin installation status is not an
 MCP connection test: verify with a new Codex task in a bound workspace and an
