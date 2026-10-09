@@ -71,7 +71,9 @@ jobs:
       - name: Test Windows IPC, credential vault and Codex plugin
         run: |
           cargo test --locked -p clumsiesd --lib credentials::windows:: -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p clumsiesd --lib ipc::platform::tests::pipe_is_exclusive_local_and_transfers_bounded_frames -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p clumsiesd --lib agent_adapter::codex_plugin::
       - name: Test Windows database paths and memory retrieval
         run: |
